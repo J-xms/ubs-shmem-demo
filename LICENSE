@@ -1,0 +1,31 @@
+Mulan PSL v2
+=============
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the Mulan PSL v2 as published by MulanPolYingChuangYinBan (the "License").
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+See the Mulan PSL v2 for more details.
+
+You should have received a copy of the Mulan PSL v2 along with this program.
+If not, see <http://license.coscl.org.cn/MulanPSL2>.
+
+SPDX-License-Identifier: MulanPSL-2.0
+
+Additional permission under Mulan PSL v2, Section 3:
+
+A "License" under this Agreement is a permission document that describes
+the terms and conditions for granting permission to Use the Licensed Software,
+and each Contributor hereby grants to You a world-wide, royalty-free,
+non-exclusive license to Use the Licensed Software for the sole purpose of
+performing the Licensed Software and exercising the rights granted under
+the terms and conditions of this License.
+
+A "Library" under this Agreement means a collection of software distributed
+by a License that is linked together with the Licensed Software, rather than
+linked together with a separate software module that is not part of the Licensed
+Software.
+
+You may copy and distribute copies of the Library in source and/or binary form.
