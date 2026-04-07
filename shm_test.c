@@ -28,6 +28,7 @@
 #define DEFAULT_SHM_NAME "demo_shm"
 #define DEFAULT_REGION   "default"
 #define DEFAULT_ITERS    100000
+#define MIN_SHM_NAME_LEN 1
 
 /* 错误处理 */
 #define CHECK_RET(ret, msg) do { \
@@ -49,17 +50,18 @@ static double now_ms(void)
  * 获取虚拟地址对应的物理地址
  * 通过 /proc/self/pagemap 获取页帧号，再计算物理地址
  *
+ * 注意: 对于UBS远程共享内存，这里显示的是本地物理地址(UB控制器用来
+ *       寻址远程内存的地址)，不是远程物理内存的实际地址。
+ *
  * @param vaddr 虚拟地址
  * @return 物理地址 (uint64_t), 0表示获取失败
  */
 static uint64_t get_physical_address(void *vaddr)
 {
     int fd;
-    uint64_t page_frame_number = 0;
     unsigned long vaddr_ul = (unsigned long)vaddr;
     long page_size = sysconf(_SC_PAGESIZE);
     uint64_t pagemap_entry;
-    ssize_t ret;
 
     /* 打开pagemap文件 */
     fd = open("/proc/self/pagemap", O_RDONLY);
@@ -72,7 +74,7 @@ static uint64_t get_physical_address(void *vaddr)
      * pagemap中每个条目64位，条目索引 = 虚拟地址 / 页大小
      * 每个条目的结构:
      *   bits 0-54: 页帧号 (PFN)
-     *   bit  63:   页存在标志
+     *   bit  63:   页存在标志 (1=在内存中, 0=不在或换出)
      */
     off_t offset = (vaddr_ul / page_size) * sizeof(uint64_t);
     if (lseek(fd, offset, SEEK_SET) == (off_t)-1) {
@@ -81,21 +83,20 @@ static uint64_t get_physical_address(void *vaddr)
         return 0;
     }
 
-    ret = read(fd, &pagemap_entry, sizeof(pagemap_entry));
-    close(fd);
-
-    if (ret != sizeof(pagemap_entry)) {
+    if (read(fd, &pagemap_entry, sizeof(pagemap_entry)) != sizeof(pagemap_entry)) {
+        close(fd);
         return 0;
     }
+    close(fd);
 
     /* 检查页是否存在 (bit 63) */
     if ((pagemap_entry & (1ULL << 63)) == 0) {
-        /* 页不在内存中或未分配 */
+        /* 页不在内存中(可能被换出或UBS远程内存未激活) */
         return 0;
     }
 
     /* 提取页帧号 (bits 0-54) */
-    page_frame_number = pagemap_entry & ((1ULL << 55) - 1);
+    uint64_t page_frame_number = pagemap_entry & ((1ULL << 55) - 1);
 
     /* 计算物理地址 = 页帧号 * 页大小 + 页内偏移 */
     uint64_t offset_in_page = vaddr_ul % page_size;
@@ -113,7 +114,6 @@ static uint64_t get_page_frame_number(void *vaddr)
     unsigned long vaddr_ul = (unsigned long)vaddr;
     long page_size = sysconf(_SC_PAGESIZE);
     uint64_t pagemap_entry;
-    ssize_t ret;
 
     fd = open("/proc/self/pagemap", O_RDONLY);
     if (fd < 0) {
@@ -126,12 +126,12 @@ static uint64_t get_page_frame_number(void *vaddr)
         return 0;
     }
 
-    ret = read(fd, &pagemap_entry, sizeof(pagemap_entry));
-    close(fd);
-
-    if (ret != sizeof(pagemap_entry) || ((pagemap_entry & (1ULL << 63)) == 0)) {
+    if (read(fd, &pagemap_entry, sizeof(pagemap_entry)) != sizeof(pagemap_entry) ||
+        ((pagemap_entry & (1ULL << 63)) == 0)) {
+        close(fd);
         return 0;
     }
+    close(fd);
 
     return pagemap_entry & ((1ULL << 55) - 1);
 }
@@ -150,13 +150,29 @@ static void print_address_info(void *vaddr, size_t length)
     printf("  │              地 址 信 息                             │\n");
     printf("  ├─────────────────────────────────────────────────────┤\n");
     printf("  │  虚拟地址 (VA):     0x%016lx                   │\n", (unsigned long)vaddr);
-    printf("  │  物理地址 (PA):     0x%016lx                   │\n", phys_addr);
+    printf("  │  本地物理地址 (PA): 0x%016lx                   │\n", phys_addr);
     printf("  │  页帧号 (PFN):     %-20lu              │\n", (unsigned long)pfn);
     printf("  │  页大小:           %ld bytes                        │\n", page_size);
     printf("  │  映射长度:         %zu bytes                        │\n", length);
     printf("  │  页内偏移:         %ld                               │\n", (unsigned long)vaddr % page_size);
     printf("  └─────────────────────────────────────────────────────┘\n");
     printf("\n");
+}
+
+/*
+ * 安全打印吞吐量，避免除零
+ */
+static void print_throughput(const char *op, int count, double elapsed_ms)
+{
+    if (elapsed_ms < 0.001) {
+        /* 太快了，无法准确测量 */
+        printf("  %s耗时: < 0.001 ms (执行太快，无法准确测量)\n", op);
+        return;
+    }
+    double ops_per_sec = count / elapsed_ms * 1000.0;
+    double million_per_sec = ops_per_sec / 10000.0;
+    printf("  %s %d 次: %.3f ms (%.2f 万次/秒)\n",
+           op, count, elapsed_ms, million_per_sec);
 }
 
 int main(int argc, char *argv[])
@@ -170,6 +186,12 @@ int main(int argc, char *argv[])
     /* ---- 参数解析 ---- */
     shm_name = (argc > 1) ? argv[1] : DEFAULT_SHM_NAME;
     iterations = (argc > 2) ? atoi(argv[2]) : DEFAULT_ITERS;
+
+    /* 参数校验 */
+    if (iterations <= 0) {
+        fprintf(stderr, "[错误] 迭代次数必须 > 0\n");
+        return 1;
+    }
 
     printf("============================================================\n");
     printf("       UBS Shared Memory 映射读写示例\n");
@@ -213,7 +235,7 @@ int main(int argc, char *argv[])
     printf("[Step 4] 执行写入测试...\n");
     printf("------------------------------------------------------------\n");
     printf("写入虚拟地址: %p\n", addr);
-    printf("写入物理地址: 0x%lx\n", get_physical_address(addr));
+    printf("写入物理地址: 0x%lx\n\n", get_physical_address(addr));
 
     double t0 = now_ms();
     for (int i = 0; i < iterations; i++) {
@@ -222,14 +244,13 @@ int main(int argc, char *argv[])
     }
     double t1 = now_ms();
     printf("写入值: %ld (最后写入的值)\n", (long)*(int64_t*)addr);
-    printf("写入耗时: %.3f ms (%.2f 万次/秒)\n\n",
-           t1 - t0, iterations / (t1 - t0) / 10.0);
+    print_throughput("写入", iterations, t1 - t0);
 
     /* ---- 读取测试 ---- */
-    printf("[Step 5] 执行读取测试...\n");
+    printf("\n[Step 5] 执行读取测试...\n");
     printf("------------------------------------------------------------\n");
     printf("读取虚拟地址: %p\n", addr);
-    printf("读取物理地址: 0x%lx\n", get_physical_address(addr));
+    printf("读取物理地址: 0x%lx\n\n", get_physical_address(addr));
 
     int64_t sum = 0;
     int64_t expected = (int64_t)iterations * (iterations - 1) / 2;
@@ -241,7 +262,7 @@ int main(int argc, char *argv[])
     }
     t1 = now_ms();
     printf("读取值: %ld\n", (long)*(int64_t*)addr);
-    printf("读取耗时: %.3f ms (%.2f 万次/秒)\n", t1 - t0, iterations / (t1 - t0) / 10.0);
+    print_throughput("读取", iterations, t1 - t0);
     printf("校验和: %ld vs 期望: %ld %s\n\n",
            (long)sum, (long)expected,
            (sum == expected) ? "✓ 通过" : "✗ 失败");
@@ -251,16 +272,19 @@ int main(int argc, char *argv[])
     printf("------------------------------------------------------------\n");
     /*
      * 对于缓存模式(UBSM_FLAG_CACHE)的共享内存:
-     * 读写后调用 set_ownership(..., PROT_NONE) 刷除和失效数据缓存
+     *   set_ownership(..., PROT_NONE) 有两层作用:
+     *   1. 刷除CPU缓存中的数据
+     *   2. 失效CPU缓存,确保后续读取从真实内存获取
+     *
+     * 对于非缓存模式(UBSM_FLAG_NONCACHE), 可跳过此步骤
      */
     ret = ubsmem_shmem_set_ownership(shm_name, addr, length, PROT_NONE);
     CHECK_RET(ret, "set_ownership (flush)");
 
-    /* 刷新后再次打印地址信息 */
     printf("刷新后:\n");
     printf("  虚拟地址: %p\n", addr);
     printf("  物理地址: 0x%lx\n", get_physical_address(addr));
-    printf("  状态: PROT_NONE (CPU缓存已失效)\n\n");
+    printf("  状态: PROT_NONE (缓存已刷除并失效)\n\n");
 
     /* ---- 清理 ---- */
     printf("[Step 7] 清理资源...\n");
